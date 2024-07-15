@@ -1,0 +1,182 @@
+# =============================================================================
+# prometheus.yml — Prometheus scrape and alerting configuration
+#
+# Deployment: runs as a sidecar or standalone container in the same VPC.
+# In AWS ECS, Prometheus is deployed as an additional service in the cluster
+# and uses ECS service discovery to find targets.
+#
+# Scrape targets:
+#   - prometheus     — self-scrape for Prometheus internals
+#   - app            — application metrics exposed on /metrics
+#   - nginx-exporter — nginx stub_status metrics
+#   - node-exporter  — host-level OS metrics
+#   - cadvisor       — container resource metrics
+#   - cloudwatch     — CloudWatch metrics via yet-another-cloudwatch-exporter
+# =============================================================================
+
+global:
+  scrape_interval:     15s    # How frequently to scrape targets
+  evaluation_interval: 15s    # How frequently to evaluate alert rules
+  scrape_timeout:      10s
+
+  # Labels added to all time series and alerts from this Prometheus instance
+  external_labels:
+    environment: "${ENVIRONMENT:-production}"
+    region:      "${AWS_REGION:-us-east-1}"
+    cluster:     "${ECS_CLUSTER:-myapp-production}"
+
+# ---------------------------------------------------------------------------
+# Alertmanager configuration
+# ---------------------------------------------------------------------------
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - "alertmanager:9093"
+      timeout: 10s
+
+# ---------------------------------------------------------------------------
+# Alert rule files
+# ---------------------------------------------------------------------------
+rule_files:
+  - "alert_rules.yml"
+  - "alert_rules/*.yml"
+
+# ---------------------------------------------------------------------------
+# Scrape configurations
+# ---------------------------------------------------------------------------
+scrape_configs:
+
+  # --------------------------------------------------------------------------
+  # Prometheus self-scrape
+  # --------------------------------------------------------------------------
+  - job_name: "prometheus"
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["localhost:9090"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label:  instance
+
+  # --------------------------------------------------------------------------
+  # Application metrics
+  # Expects the app container to expose /metrics (Prometheus format)
+  # --------------------------------------------------------------------------
+  - job_name: "app"
+    metrics_path: /metrics
+    scrape_interval: 15s
+    scrape_timeout:  10s
+    static_configs:
+      - targets:
+          - "app:8080"
+        labels:
+          service: "myapp"
+          tier:    "application"
+    # Drop high-cardinality labels that would cause metric explosion
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex:         "go_.*"
+        action:        drop
+
+  # --------------------------------------------------------------------------
+  # Nginx exporter (nginx/nginx-prometheus-exporter)
+  # Scrapes nginx stub_status and converts to Prometheus metrics
+  # --------------------------------------------------------------------------
+  - job_name: "nginx"
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - "nginx-exporter:9113"
+        labels:
+          service: "nginx"
+          tier:    "proxy"
+
+  # --------------------------------------------------------------------------
+  # Node Exporter — host OS metrics (CPU, memory, disk, network)
+  # --------------------------------------------------------------------------
+  - job_name: "node"
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - "node-exporter:9100"
+        labels:
+          service: "node"
+          tier:    "infrastructure"
+    # Keep only essential node metrics to reduce storage
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: "(node_cpu_seconds_total|node_memory_MemAvailable_bytes|node_memory_MemTotal_bytes|node_disk_io_time_seconds_total|node_network_receive_bytes_total|node_network_transmit_bytes_total|node_filesystem_avail_bytes|node_filesystem_size_bytes|node_load1|node_load5|node_load15|up)"
+        action: keep
+
+  # --------------------------------------------------------------------------
+  # cAdvisor — container resource usage metrics
+  # --------------------------------------------------------------------------
+  - job_name: "cadvisor"
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - "cadvisor:8080"
+        labels:
+          service: "cadvisor"
+          tier:    "infrastructure"
+    metric_relabel_configs:
+      # Drop per-CPU metrics — use aggregated instead
+      - source_labels: [cpu]
+        regex:         "cpu[0-9]+"
+        action:        drop
+      # Keep only container-level metrics
+      - source_labels: [__name__]
+        regex:         "container_(cpu_usage_seconds_total|memory_usage_bytes|memory_working_set_bytes|network_receive_bytes_total|network_transmit_bytes_total|fs_reads_bytes_total|fs_writes_bytes_total)"
+        action:        keep
+
+  # --------------------------------------------------------------------------
+  # Yet Another CloudWatch Exporter (YACE)
+  # Bridges CloudWatch metrics (ALB, RDS, ECS) into Prometheus
+  # --------------------------------------------------------------------------
+  - job_name: "cloudwatch"
+    scrape_interval: 60s   # CW metrics have 1-min resolution; more frequent is wasteful
+    static_configs:
+      - targets:
+          - "cloudwatch-exporter:5000"
+        labels:
+          service: "cloudwatch"
+          tier:    "infrastructure"
+
+  # --------------------------------------------------------------------------
+  # Postgres Exporter — RDS/PostgreSQL internal metrics
+  # Connection string provided via DATA_SOURCE_NAME env var on the exporter
+  # --------------------------------------------------------------------------
+  - job_name: "postgres"
+    scrape_interval: 30s
+    static_configs:
+      - targets:
+          - "postgres-exporter:9187"
+        labels:
+          service: "postgresql"
+          tier:    "database"
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex:         "pg_(stat_activity|stat_bgwriter|stat_database|stat_replication|locks|database_size|up).*"
+        action:        keep
+
+  # --------------------------------------------------------------------------
+  # Blackbox Exporter — external HTTP probes (uptime/availability monitoring)
+  # --------------------------------------------------------------------------
+  - job_name: "blackbox-http"
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets:
+          - "https://your-app.example.com/health"
+          - "https://your-app.example.com/api/v1/status"
+        labels:
+          service: "blackbox"
+          tier:    "external"
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label:  __param_target
+      - source_labels: [__param_target]
+        target_label:  instance
+      - target_label:  __address__
+        replacement:   "blackbox-exporter:9115"
