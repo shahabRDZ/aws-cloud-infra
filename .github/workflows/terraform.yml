@@ -1,0 +1,306 @@
+# =============================================================================
+# terraform.yml — Terraform Plan (on PR) and Apply (on merge to main)
+#
+# Flow:
+#   Pull Request  → fmt check → init → validate → tflint → plan → post comment
+#   Push to main  → fmt check → init → validate → plan → apply
+#
+# Authentication:
+#   Uses GitHub OIDC to assume an IAM role — no long-lived AWS credentials
+#   stored as GitHub secrets. The IAM role ARN is stored as a repository
+#   variable (not a secret), as it is not itself sensitive.
+#
+# Required repository variables:
+#   AWS_ACCOUNT_ID       — AWS account number
+#   AWS_REGION           — deployment region (e.g. us-east-1)
+#   TF_STATE_BUCKET      — S3 bucket name for Terraform state
+#
+# Required repository secrets:
+#   (none — OIDC is used for AWS auth)
+# =============================================================================
+
+name: Terraform
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform.yml"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Action to run (plan or apply)"
+        required: true
+        default: "plan"
+        type: choice
+        options: [plan, apply]
+
+env:
+  TF_VERSION:    "1.7.4"
+  TFLINT_VERSION: "0.50.3"
+  AWS_REGION:    ${{ vars.AWS_REGION || 'us-east-1' }}
+  TF_CLI_ARGS:   "-no-color"
+  # Prevent Terraform from asking interactive questions
+  TF_INPUT:      "false"
+
+permissions:
+  id-token:      write   # OIDC token for AWS auth
+  contents:      read
+  pull-requests: write   # Post plan comments to PR
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Lint & Validate
+  # ---------------------------------------------------------------------------
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Install tflint
+        run: |
+          curl -sLo tflint.zip "https://github.com/terraform-linters/tflint/releases/download/v${TFLINT_VERSION}/tflint_linux_amd64.zip"
+          unzip -q tflint.zip && rm tflint.zip
+          sudo mv tflint /usr/local/bin/
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/myapp-production-terraform-ci
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        id: init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate
+
+      - name: tflint
+        id: tflint
+        run: |
+          tflint --init
+          tflint --format=compact
+        continue-on-error: true
+
+      - name: Post format/validate status to PR
+        if: github.event_name == 'pull_request' && (steps.fmt.outcome == 'failure' || steps.validate.outcome == 'failure')
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = [
+              '### Terraform Validation',
+              `| Step | Status |`,
+              `|------|--------|`,
+              `| Format | ${{ steps.fmt.outcome == 'success' && ':white_check_mark:' || ':x: Run `terraform fmt -recursive`' }} |`,
+              `| Init   | ${{ steps.init.outcome == 'success' && ':white_check_mark:' || ':x:' }} |`,
+              `| Validate | ${{ steps.validate.outcome == 'success' && ':white_check_mark:' || ':x:' }} |`,
+              `| tflint | ${{ steps.tflint.outcome == 'success' && ':white_check_mark:' || ':warning: warnings' }} |`,
+            ].join('\n');
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+  # ---------------------------------------------------------------------------
+  # Plan
+  # ---------------------------------------------------------------------------
+  plan:
+    name: Plan
+    needs: validate
+    runs-on: ubuntu-latest
+    outputs:
+      plan_exit_code: ${{ steps.plan.outputs.exitcode }}
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: true
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/myapp-production-terraform-ci
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan \
+            -out=tfplan \
+            -detailed-exitcode \
+            2>&1 | tee plan.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.sha }}
+          path: terraform/tfplan
+          retention-days: 1
+
+      - name: Post plan to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('terraform/plan.txt', 'utf8');
+            const MAX_CHARS = 60000;
+            const planOutput = plan.length > MAX_CHARS
+              ? plan.substring(0, MAX_CHARS) + '\n\n... (truncated, see Actions logs for full output)'
+              : plan;
+
+            const exitCode = '${{ steps.plan.outputs.exitcode }}';
+            const statusEmoji = exitCode === '0' ? '✅' : exitCode === '2' ? '⚠️ Changes' : '❌';
+
+            const body = [
+              `### Terraform Plan ${statusEmoji}`,
+              `**Exit code:** \`${exitCode}\` (0=no changes, 2=changes pending, 1=error)`,
+              `**Commit:** \`${{ github.sha }}\``,
+              '',
+              '<details>',
+              '<summary>Show full plan</summary>',
+              '',
+              '```hcl',
+              planOutput,
+              '```',
+              '',
+              '</details>',
+            ].join('\n');
+
+            // Delete previous plan comments to keep PR tidy
+            const { data: comments } = await github.rest.issues.listComments({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            for (const c of comments) {
+              if (c.body.startsWith('### Terraform Plan')) {
+                await github.rest.issues.deleteComment({
+                  comment_id: c.id,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                });
+              }
+            }
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
+
+      - name: Fail if plan errored
+        if: steps.plan.outputs.exitcode == '1'
+        run: exit 1
+
+  # ---------------------------------------------------------------------------
+  # Apply (main branch only)
+  # ---------------------------------------------------------------------------
+  apply:
+    name: Apply
+    needs: plan
+    runs-on: ubuntu-latest
+    environment: production   # Requires manual approval in GitHub Environments
+    if: >
+      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && inputs.action == 'apply')
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/myapp-production-terraform-ci
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ github.sha }}
+          path: terraform/
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+
+      - name: Capture outputs
+        id: outputs
+        run: |
+          terraform output -json > tf-outputs.json
+          echo "alb_dns=$(terraform output -raw alb_dns_name 2>/dev/null || echo 'N/A')" >> "$GITHUB_OUTPUT"
+
+      - name: Post apply summary
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await core.summary
+              .addHeading('Terraform Apply Complete')
+              .addTable([
+                [{data: 'Output', header: true}, {data: 'Value', header: true}],
+                ['ALB DNS', '${{ steps.outputs.outputs.alb_dns }}'],
+                ['Commit', '${{ github.sha }}'],
+                ['Run', `[#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`],
+              ])
+              .write();

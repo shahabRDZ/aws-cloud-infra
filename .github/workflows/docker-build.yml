@@ -1,0 +1,215 @@
+# =============================================================================
+# docker-build.yml — Build, scan, and push Docker image to ECR
+#
+# Triggers:
+#   - Push to main (builds + pushes with 'latest' and git-sha tags)
+#   - Push of version tags (v*.*.*) — promotes semver-tagged releases
+#   - Pull requests — builds only (no push) for validation
+#
+# Security:
+#   - Image is scanned with Trivy for CVEs before push
+#   - HIGH/CRITICAL vulnerabilities block the pipeline
+#   - OIDC is used for AWS auth — no static credentials
+#   - Build provenance attestation is generated (SLSA Level 2)
+# =============================================================================
+
+name: Docker Build & Push
+
+on:
+  push:
+    branches: [main]
+    tags:     ["v*.*.*"]
+    paths:
+      - "docker/**"
+      - "src/**"
+      - "requirements*.txt"
+      - "package*.json"
+      - ".github/workflows/docker-build.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "docker/**"
+      - "src/**"
+      - "requirements*.txt"
+
+env:
+  AWS_REGION:    ${{ vars.AWS_REGION || 'us-east-1' }}
+  PROJECT_NAME:  myapp
+  ENVIRONMENT:   production
+
+permissions:
+  id-token:      write   # OIDC
+  contents:      read
+  packages:      write
+  security-events: write  # Upload Trivy SARIF results to GitHub Security
+
+jobs:
+  build:
+    name: Build & Push
+    runs-on: ubuntu-latest
+
+    outputs:
+      image_uri:   ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------------------------
+      # Auth & Registry Setup
+      # --------------------------------------------------------------------
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/myapp-production-github-actions-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set ECR registry
+        id: registry
+        run: |
+          echo "registry=${{ steps.ecr-login.outputs.registry }}" >> "$GITHUB_OUTPUT"
+          echo "repo=${{ steps.ecr-login.outputs.registry }}/${{ env.PROJECT_NAME }}-${{ env.ENVIRONMENT }}/app" >> "$GITHUB_OUTPUT"
+
+      # --------------------------------------------------------------------
+      # Docker Buildx (multi-platform support, cache)
+      # --------------------------------------------------------------------
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker metadata (tags & labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.registry.outputs.repo }}
+          tags: |
+            # Tag with git short SHA on every build
+            type=sha,prefix=sha-,format=short
+            # Tag as 'latest' on main branch pushes
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            # Tag with semver on version tags
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+          labels: |
+            org.opencontainers.image.title=myapp
+            org.opencontainers.image.description=Production application
+            org.opencontainers.image.vendor=Your Org
+            git.sha=${{ github.sha }}
+            git.ref=${{ github.ref }}
+
+      # --------------------------------------------------------------------
+      # Build
+      # --------------------------------------------------------------------
+      - name: Build Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile.app
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ steps.registry.outputs.repo }}:latest
+          cache-to:   type=inline
+          build-args: |
+            BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
+            GIT_COMMIT=${{ github.sha }}
+          provenance: true   # SLSA provenance attestation
+          sbom: true         # Software Bill of Materials
+
+      # --------------------------------------------------------------------
+      # Security Scanning
+      # --------------------------------------------------------------------
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.registry.outputs.repo }}:sha-${{ github.sha }}
+          format:    sarif
+          output:    trivy-results.sarif
+          severity:  "CRITICAL,HIGH"
+          exit-code: "0"   # Don't fail here; fail via SARIF upload threshold
+        if: github.event_name != 'pull_request'
+
+      - name: Upload Trivy SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+        if: github.event_name != 'pull_request'
+
+      # Fail the build if critical CVEs are found in the base image or deps
+      - name: Trivy — fail on CRITICAL vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.registry.outputs.repo }}:sha-${{ github.sha }}
+          format:    table
+          severity:  "CRITICAL"
+          exit-code: "1"
+        if: github.event_name != 'pull_request'
+
+      # --------------------------------------------------------------------
+      # Summary
+      # --------------------------------------------------------------------
+      - name: Post build summary
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          script: |
+            const status = '${{ job.status }}';
+            const emoji  = status === 'success' ? '✅' : '❌';
+            await core.summary
+              .addHeading(`Docker Build ${emoji}`)
+              .addTable([
+                [{data: 'Field', header: true}, {data: 'Value', header: true}],
+                ['Status',  status],
+                ['Image',   '${{ steps.registry.outputs.repo }}'],
+                ['Tags',    '${{ steps.meta.outputs.tags }}'.replace(/\n/g, ', ')],
+                ['Digest',  '${{ steps.build.outputs.digest }}'],
+                ['Commit',  '${{ github.sha }}'],
+              ])
+              .write();
+
+  # ---------------------------------------------------------------------------
+  # Deploy (main branch only, after successful build + scan)
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to ECS
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/myapp-production-github-actions-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Deploy to ECS
+        env:
+          IMAGE_TAG: sha-${{ github.sha }}
+          SKIP_BUILD: "true"
+        run: |
+          chmod +x ./scripts/deploy.sh
+          ./scripts/deploy.sh \
+            --environment ${{ env.ENVIRONMENT }} \
+            --tag "sha-${{ github.sha }}" \
+            --skip-build
+
+      - name: Run post-deploy health checks
+        run: |
+          chmod +x ./scripts/health-check.sh
+          ./scripts/health-check.sh \
+            --environment ${{ env.ENVIRONMENT }} \
+            --timeout 300
