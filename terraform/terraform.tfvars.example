@@ -1,0 +1,101 @@
+###############################################################################
+# terraform.tfvars.example
+#
+# Copy this file to terraform.tfvars and fill in your values.
+# NEVER commit terraform.tfvars to version control — it is in .gitignore.
+#
+# Usage:
+#   cp terraform/terraform.tfvars.example terraform/terraform.tfvars
+#   # Edit terraform.tfvars with your values
+#   make plan
+###############################################################################
+
+###############################################################################
+# Global
+###############################################################################
+
+project_name = "myapp"
+environment  = "production"
+aws_region   = "us-east-1"
+
+###############################################################################
+# Networking
+###############################################################################
+
+vpc_cidr              = "10.0.0.0/16"
+public_subnet_cidrs   = ["10.0.1.0/24", "10.0.2.0/24"]
+private_subnet_cidrs  = ["10.0.10.0/24", "10.0.11.0/24"]
+database_subnet_cidrs = ["10.0.20.0/24", "10.0.21.0/24"]
+
+# Set to true to use a single NAT Gateway (saves ~$30/mo; not HA)
+single_nat_gateway = false
+
+###############################################################################
+# ECS / Application
+###############################################################################
+
+ecs_task_cpu    = 512    # 0.5 vCPU
+ecs_task_memory = 1024   # 1 GiB
+
+app_desired_count = 2
+app_min_count     = 2
+app_max_count     = 10
+app_port          = 8080
+
+# Image tag is typically overridden by CI/CD — set "latest" for initial deploy
+app_image_tag = "latest"
+
+# Set to true to use Fargate Spot for cost savings (non-production recommended)
+enable_fargate_spot = false
+
+###############################################################################
+# RDS
+###############################################################################
+
+rds_engine_version        = "15.4"
+rds_instance_class        = "db.t3.medium"
+rds_allocated_storage     = 20
+rds_max_allocated_storage = 100
+rds_multi_az              = true
+rds_backup_retention_days = 7
+rds_deletion_protection   = true
+rds_db_name               = "appdb"
+rds_username              = "dbadmin"
+
+###############################################################################
+# ALB / HTTPS
+###############################################################################
+
+# Paste your ACM certificate ARN here.
+# Create a certificate with: aws acm request-certificate --domain-name myapp.example.com
+certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+# Enable AWS WAF on the ALB (requires additional WAF configuration)
+enable_waf = false
+
+###############################################################################
+# S3
+###############################################################################
+
+# WARNING: setting true allows `terraform destroy` to delete non-empty buckets
+s3_force_destroy = false
+
+###############################################################################
+# Monitoring & Alerting
+###############################################################################
+
+# Email to receive CloudWatch alarm notifications (leave empty to skip)
+alarm_email = "ops-team@example.com"
+
+cpu_alarm_threshold    = 80
+memory_alarm_threshold = 85
+
+###############################################################################
+# Extra Tags (optional)
+###############################################################################
+
+extra_tags = {
+  CostCenter  = "engineering"
+  Owner       = "platform-team"
+  Compliance  = "soc2"
+}
