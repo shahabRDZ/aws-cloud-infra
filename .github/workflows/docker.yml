@@ -7,8 +7,10 @@ on:
       - "docker/**"
       - "scripts/**"
       - "app/**"
+      - ".github/workflows/docker.yml"
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 env:
   AWS_REGION: eu-west-1
