@@ -213,3 +213,13 @@ aws-cloud-infra/
 ## License
 
 MIT
+
+---
+
+## Join the Discussion
+
+Have ideas or experience to share? Check out our open discussions:
+
+- [ECS Fargate vs EKS: breakeven point for small teams](https://github.com/shahabRDZ/aws-cloud-infra/discussions/25)
+
+We'd love to hear your thoughts!
