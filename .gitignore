@@ -67,3 +67,12 @@ dist/
 
 # OS
 Thumbs.db
+
+# Terraform CLI config
+.terraformrc
+terraform.rc
+crash.log
+crash.*.log
+
+# Docker Compose override
+docker-compose.override.yml
